@@ -2,8 +2,8 @@
 webassembly lua runtime
 
 current version: 5.4
-- lua.js - the javascript runtime
-- lua.wasm - the webassembly binary
+- out/lua.js - the javascript runtime
+- out/lua.wasm - the webassembly binary
 
 ## compiling
 get the lua source code [here](https://www.lua.org/download.html)
