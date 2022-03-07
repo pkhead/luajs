@@ -127,6 +127,16 @@ void luaPushFunction(lua_State* L, int index) {
 }
 
 EMSCRIPTEN_KEEPALIVE
+void luaPushSFunction(lua_State* L, lua_CFunction func) {
+	lua_pushcfunction(L, func);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void luaPushSClosure(lua_State* L, lua_CFunction func, int n_upvalues) {
+	lua_pushcclosure(L, func, n_upvalues);
+}
+
+EMSCRIPTEN_KEEPALIVE
 void luaAddFunction(lua_State* L, const char* name, lua_CFunction func) {
 	lua_pushcfunction(L, func);
 	lua_setglobal(L, name);
