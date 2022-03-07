@@ -29,9 +29,88 @@ function allocString(str) {
 	return alloc;
 }
 
+Lua._functions = {};
+Lua._nfunctions = 0;
+const LUA_MAX_FUNCTIONS = 2048;
+
+/**
+* Registers a function
+* @param {function} func The function to register
+* @param {integer} ptr The ID of the registered function
+*/
+function allocFunction(func) {
+	if (Lua._nfunctions >= LUA_MAX_FUNCTIONS) {
+		throw new RangeError("Num functions exceeded");
+	}
+	
+	let ptr;
+	
+	do {
+		ptr = Math.floor(Math.random() * LUA_MAX_FUNCTIONS);
+	} while (ptr in Lua._functions);
+	
+	Lua._nfunctions++;
+	
+	Lua._functions[ptr] = L => func(new LuaState(L));
+	
+	return ptr;
+}
+
+/**
+* Unregisters a function
+* @param {integer} ptr The ID of the function to unregister
+*/
+function deallocFunction(ptr) {
+	if (ptr in Lua._functions) {
+		delete Lua._functions[ptr];
+		Lua._nfunctions--;
+	}
+}
+
+/**
+* Unregisters all functions
+*/
+function clearFunctions() {
+	Lua._functions = {};
+	Lua._nfunctions = 0;
+}
+
+/**
+* Adds a static function. These functions are permanent and have faster access.
+* Well I think it would anyway. Using this probably won't even make a significant optimization.
+* It is slower to insert, though.
+* @param {function} func The function to add
+* @returns {integer} ptr The pointer to the function
+*/
+function addStaticFunction(func) {
+	return addFunction(func, "ii");
+}
+
+Lua.clearFunctionTable = clearFunctions
+Lua.registerFunc = allocFunction
+Lua.unregisterFunc = deallocFunction
+Lua.addStaticFunction = addStaticFunction;
+Lua.TNONE = -1;
+Lua.TNIL = 0;
+Lua.TBOOLEAN = 1;
+Lua.TLIGHTUSERDATA = 2;
+Lua.TNUMBER = 3;
+Lua.TSTRING = 4;
+Lua.TTABLE = 5;
+Lua.TFUNCTION = 6;
+Lua.TUSERDATA = 7;
+Lua.TTHREAD = 8;
+
+class LuaError extends Error {
+	constructor(msg) {
+		super(msg);
+		this.name = "LuaError";
+	}
+}
+
 function createLibraryData(libData) {
 	var numFunctions = Object.keys(libData).length;
-	var allocLen = (numFunctions + 1) * 8; // functions in libData, + 1 sentinent value (completely null)
+	var allocLen = (numFunctions + 1) * 8; // functions in libData, + 1 sentinel value (completely null)
 	var alloc = _malloc(allocLen);
 
 	if (alloc === 0) {
@@ -65,99 +144,158 @@ function createLibraryData(libData) {
 	};
 }
 
-var luaStates = new Map();
-Lua._functions = {};
-Lua._nfunctions = 0;
-const LUA_MAX_FUNCTIONS = 2048;
+class LuaUserdata {}
 
-function allocFunction(func) {
-	if (Lua._nfunctions >= LUA_MAX_FUNCTIONS) {
-		throw new RangeError("Num functions exceeded");
+var udTypes = {};
+
+/**
+* Defines a userdata type
+* @param {string} name The type name
+* @param {Object} struct The type data
+* @param {boolean} align If the data should be 16-bit aligned
+*/
+Lua.defineUserdata = function(name, struct, align = true) {
+	var size = 0;
+	var indices = {};
+
+	for (let k in struct) {
+		let t = struct[k];
+
+		let ptr = size;
+		let elem_size;
+
+		switch (t) {
+			case "int":
+				elem_size = 4;
+				break;
+				
+			case "long":
+				elem_size = 8;
+				break;
+				
+			case "float":
+				elem_size = 4;
+				break;
+				
+			case "double":
+				elem_size = 8;
+				break;
+				
+			default: // "string" + string_len (e.g. string64, string5)
+				if (t.slice(0, 6) !== "string") {
+						throw new TypeError("Invalid type " + t);
+				}
+				
+				let len = +(t.slice(6));
+				
+				if (Number.isNaN(len)) {
+					throw new TypeError("Invalid type " + t);
+				}
+				
+				elem_size = len + 1;
+				t = "string";
+				break;
+		}
+		
+		// item 0 is the pointer to the element
+		indices[k] = [size, t, elem_size];
+		
+		if (align) {
+			// make sure elements are aligned
+			size += Math.ceil(elem_size / 8) * 8;
+		} else {
+			size += elem_size;
+		}
 	}
 	
-	let ptr;
-	
-	do {
-		ptr = Math.floor(Math.random() * LUA_MAX_FUNCTIONS);
-	} while (ptr in Lua._functions);
-	
-	Lua._nfunctions++;
-	
-	Lua._functions[ptr] = func;
-	
-	return ptr;
-}
+	udTypes[name] = {
+		size: size,
+		indices: indices
+	};
+};
 
-function deallocFunction(ptr) {
-	if (ptr in Lua._functions) {
-		delete Lua._functions[ptr];
-		Lua._nfunctions--;
+function constructUserdata(ptr, typeName) {
+	var struct = udTypes[typeName];
+	var ud = new LuaUserdata();
+
+	for (let k in struct.indices) {
+		let v = struct.indices[k];
+
+		let get_f, set_f;
+		let type;
+		let p = ptr + v[0];
+		let elem_size = v[2];
+
+		switch (v[1]) {
+			case "int":
+				type = "i32";
+				break;
+
+			case "long":
+				type = "i64";
+				break;
+
+			case "float":
+				type = "float";
+				break;
+			
+			case "double":
+				type = "double";
+				break;
+				
+			case "string":
+				type = "string";
+				break;
+		}
+
+		if (type === "string") {
+			Object.defineProperty(ud, k, {
+				get() {
+					return UTF8ToString(p, elem_size);
+				},
+
+				set(v) {
+					stringToUTF8(v, p, elem_size);
+				}
+			});
+		} else {
+			Object.defineProperty(ud, k, {
+				get() {
+					return getValue(p, type);
+				},
+
+				set(v) {
+					setValue(p, v, type);
+				}
+			});
+		}
 	}
+
+	ud.__ptr__ = ptr;
+	return ud;
 }
 
-function clearFunctions() {
-	Lua._functions = {};
-	Lua._nfunctions = 0;
-}
-
-Lua.clearFunctionTable = clearFunctions
-Lua.deallocFunction = deallocFunction
-Lua.clearFunctionTable = clearFunctions
-Lua.TNONE = -1;
-Lua.TNIL = 0;
-Lua.TBOOLEAN = 1;
-Lua.TLIGHTUSERDATA = 2;
-Lua.TNUMBER = 3;
-Lua.TSTRING = 4;
-Lua.TTABLE = 5;
-Lua.TFUNCTION = 6;
-Lua.TUSERDATA = 7;
-Lua.TTHREAD = 8;
-
-class LuaUserdata {
-}
-
-class LuaError extends Error {
-	constructor(msg) {
-		super(msg);
-		this.name = "LuaError";
-	}
+/**
+* Casts a userdata from one type to another.
+* @param {LuaUserdata} source The userdata to cast
+* @param {string} destType The type to cast to
+* @returns {LuaUserdata} The casted userdata
+*/
+Lua.castUserdata = function(source, destType) {
+	return constructUserdata(source.__ptr__, destType);
 }
 
 class LuaState {
-	constructor(parent) {
-		if (parent && !(parent instanceof LuaState)) {
-			throw new TypeError("Expected parent LuaState");
-		}
-		
-		this.parent = parent || null;
-		
-		if (parent) {
-			this.L = _luaNewThread(parent.L);
-			this.userdatas = parent.userdatas;
-		} else {
-			this.L = _luaNewState();
-			this.userdatas = new Map();
-		}
-		
-		this._closed = false;
-		luaStates.set(this.L, this);
+	constructor(ptr) {
+		this.L = ptr;
 	}
 
 	/**
 	* Closes this state. Make sure to call this when you are finished with it.
+	* Should not be called if the Lua.State is a thread
 	*/
 	close() {
-		if (this._closed) {
-			throw new Error("Lua.State is already closed");
-		}
-		
-		this._closed = true;
-		
-		if (!this.parent) _luaCloseState(this.L);
-		
-		luaStates.delete(this.L);
-		//this.unlinkAllUserdata();
+		_luaCloseState(this.L);
 	}
 
 	pushNil() {
@@ -208,20 +346,79 @@ class LuaState {
 		_free(c_str);
 	}
 
-	// push a value from the stack onto the top
+	/**
+	* Push a value from the stack onto the top
+	* @param {integer} index The index of the value to push to the top
+	*/
 	pushFromStack(index) {
 		_luaPushValue(this.L, index);
+	}
+	
+	/**
+	* Push a JavaScript primitive.
+	* @param {any} The primitive
+	*/
+	pushPrimitive(value) {
+		if (value === null) {
+			this.pushNil();
+			return;
+		}
+		
+		switch (typeof(value)) {
+			case "number":
+				this.pushNumber(value);
+				break;
+			case "string":
+				this.pushString(value);
+				break;
+			case "boolean":
+				this.pushBoolean(value);
+				break;
+			case "function":
+				throw new TypeError(`Invalid type "function" for pushPrimitive`);
+			case "object":
+				throw new TypeError(`Invalid type "object" for pushPrimitive`);
+		}
 	}
 
 	/**
 	* Pushes a function onto the stack.
+	* @param {integer} func The ID of the function to push. Call Lua.registerFunc to register a function.
+	*/
+	pushFunctionId(f_ptr) {
+		if (!(f_ptr in Lua._functions)) {
+			throw new Error(`Function ${f_ptr} is not registered.`);
+		}
+		
+		_luaPushFunction(this.L, f_ptr);
+	}
+	
+	/**
+	* Registers function and pushes it onto the stack.
 	* @param {function} func The function to push
-	* @returns The pointer to the function
+	* @returns {integer} The ID of the registered function
 	*/
 	pushFunction(func) {
-		var f_ptr = allocFunction(L_ptr => func(luaStates.get(L_ptr)), "ii");
-		_luaPushFunction(this.L, f_ptr);
-		return f_ptr
+		var f_ptr = allocFunction(func);
+		this.pushFunctionId(f_ptr);
+		return f_ptr;
+	}
+	
+	/**
+	* Pushes a static function onto the stack.
+	* @param {integer} func The pointer to the function
+	*/
+	pushStaticFunction(f_ptr) {
+		_luaPushSFunction(this.L, f_ptr);
+	}
+	
+	/**
+	* Pushes a static closure onto the stack.
+	* @param {integer} func The pointer to the function
+	* @param {integer} numUpvalues The amount of upvalues
+	*/
+	pushStaticClosure(f_ptr, numUpvalues) {
+		_luaPushSClosure(this.L, f_ptr, numUpvalues);
 	}
 
 	setGlobal(name) {
@@ -278,10 +475,20 @@ class LuaState {
 		_free(ptr);
 	}
 
+	/**
+	* Gets the type of the value at index
+	* @param {integer} index The index of the desired value.
+	* @returns {integer} The type represented as a number. Use the Lua.T(...) constants to check values.
+	*/
 	getType(index) {
 		return _luaGetType(this.L, index)
 	}
 
+	/**
+	* Creates a Lua library consisting of static functions.
+	* @param {string} name The name of the library
+	* @param {object] libData The table of functions
+	*/
 	addLibrary(name, libData) {
 		var c_name = allocString(name);
 		var lib = createLibraryData(libData);
@@ -289,14 +496,12 @@ class LuaState {
 		_free(c_name);
 	}
 
+	/**
+	* Sets global variable to a function.
+	* @param {string} name The variable name
+	* @param {function} f The function
+	*/
 	addFunction(name, f) {
-		/*
-		var c_name = allocString(name);
-		var f_ptr = allocFunction(L_ptr => f(luaStates.get(L_ptr)));
-
-		_luaAddFunction(this.L, c_name, f_ptr);
-
-		_free(c_name);*/
 		var ptr = this.pushFunction(f);
 		this.setGlobal(name);
 		
@@ -480,158 +685,62 @@ class LuaState {
 	 * @param {object} struct an object with keys as key names, and values as their key types 
 	 * @returns a LuaUserdata with key/values specified in struct
 	 */
-	createUserdata(struct, align = true) {
-		var size = 0;
-
-		var indices = {};
-
-		for (let k in struct) {
-			let t = struct[k];
-
-			let ptr = size;
-			let elem_size;
-
-			switch (t) {
-				case "int":
-					elem_size = 4;
-					break;
-				case "number":
-					elem_size = 8;
-					break;
-				case "boolean":
-					elem_size = 4;
-					break;
-				default: // "string" + string_len (e.g. string64, string5)
-					if (t.slice(0, 6) !== "string") {
-							throw new TypeError("Invalid type " + t);
-					}
-					
-					let len = +(t.slice(6));
-					
-					if (Number.isNaN(len)) {
-						throw new TypeError("Invalid type " + t);
-					}
-					
-					elem_size = len + 1;
-					t = "string";
-					break;
-			}
-			
-			indices[k] = [size, t, elem_size];
-			
-			if (align) {
-				// make sure elements are aligned
-				size += Math.ceil(elem_size / 8) * 8;
-			} else {
-				size += elem_size;
-			}
-		}
-
-		var ptr = _luaNewUserdata(this.L, size);
-		var ud = new LuaUserdata();
-
-		for (let k in indices) {
-			let v = indices[k];
-
-			let get_f, set_f;
-			let type;
-			let p = ptr + v[0];
-			let elem_size = v[2];
-
-			switch (v[1]) {
-				case "int":
-					type = "i32";
-					break;
-
-				case "boolean":
-					type = "i32";
-					break;
-
-				case "number":
-					type = "double";
-					break;
-					
-				case "string":
-					type = "string";
-					break;
-			}
-
-			if (type === "string") {
-				Object.defineProperty(ud, k, {
-					get() {
-						if (this.__freed__) throw new Error("Attempt to access data of unlinked userdata");
-						return UTF8ToString(p, elem_size);
-					},
-
-					set(v) {
-						if (this.__freed__) throw new Error("Attempt to access data of unlinked userdata");
-						stringToUTF8(v, p, elem_size);
-					}
-				});
-			} else {
-				Object.defineProperty(ud, k, {
-					get() {
-						if (this.__freed__) throw new Error("Attempt to access data of unlinked userdata");
-						return getValue(p, type);
-					},
-
-					set(v) {
-						if (this.__freed__) throw new Error("Attempt to access data of unlinked userdata");
-						setValue(p, v, type);
-					}
-				});
-			}
-		}
-
-		ud.__ptr__ = ptr;
-		ud.__freed__ = false;
-		this.userdatas.set(ptr, ud);
-
-		return ud;
+	createUserdata(typeName) {
+		var ptr = _luaNewUserdata(this.L, udTypes[typeName].size);
+		return constructUserdata(ptr, typeName);
 	}
 
 	/**
-	 * Unlinks the userdata from the userdata register.
-	 * Call this when the userdata is garbage collected.
-	 * @param {LuaUserdata} data The userdata object to unlink 
-	 */
-	unlinkUserdata(data) {
-		data.__freed__ = true;
-		this.userdatas.delete(data.__ptr__);
+	* Gets a userdata value
+	* @param {integer} index The index to retrieve the userdata
+	* @param {string} type The type of userdata
+	*/
+	getUserdata(index, type) {
+		var ptr = _luaGetUserdata(this.L, index);
+		return constructUserdata(ptr, type);
 	}
 
-	unlinkAllUserdata() {
-		for (let pair of this.userdatas) {
-			pair[1].__freed__ = true;
-		}
-		
-		this.userdatas.clear();
-	}
-
-	getUserdata(index) {
-		return this.userdatas.get(_luaGetUserdata(this.L, index));
-	}
-
-	checkUserdata(index, tname) {
+	/**
+	* Gets a userdata value with the specified metatable name
+	* @param {integer} index The index with which to retrieve the userdata
+	* @param {string} tname The required metatable name
+	* @param {string} structName The type of userdata
+	* @returns {Lua.Userdata} The Lua.Userdata if it matches tname, otherwise null
+	*/
+	checkUserdata(index, tname, structName) {
 		var c_tname = allocString(tname);
-		var ud = this.userdatas.get(_luaCheckUserdata(this.L, index, c_tname));
+		var ptr = _luaCheckUserdata(this.L, index, c_tname);
 		_free(c_tname);
-
-		return ud;
+		
+		if (ptr === 0) return null;
+		return constructUserdata(structName);
 	}
 
+	/**
+	* Creates a metatable with a given name.
+	* @param {string} id The name of the metatable
+	*/
 	createMetatable(id) {
 		var c_tname = allocString(id);
 		_luaNewMetatable(this.L, c_tname);
 		_free(c_tname);
 	}
 
+	/**
+	* Pops a table from the stack and sets it as the new metatable for the value at the given index.
+	* @param {integer} index The index of the value
+	*/
 	setMetatable(index) {
 		_luaSetMetatable(this.L, index);
 	}
 
+	/**
+	* Gets the metatable of a table or userdata
+	* @param {integer} index The index of the table/userdata
+	* @returns {boolean} If the item at index has a metatable
+	*/
 	getMetatable(index) {
-		return _luaGetMetatableFromValue(this.L, index);
+		return _luaGetMetatableFromValue(this.L, index) == 1;
 	}
 
 	getMetafield(index, key) {
@@ -641,12 +750,20 @@ class LuaState {
 		return s;
 	}
 
+	/**
+	* Pushes metatable of given name
+	* @param {string} name The name of the metatable
+	*/
 	pushMetatable(name) {
 		var c_name = allocString(name);
 		_luaGetMetatable(this.L, c_name);
 		_free(c_name);
 	}
 
+	/**
+	* Pushes light userdata onto the stack.
+	* @param {integer} ptr A pointer to a memory address
+	*/
 	pushLightUserdata(ptr) {
 		_luaPushLightUserdata(this.L, ptr);
 	}
@@ -738,7 +855,7 @@ class LuaState {
 
 	/**
 	* Pushes a reference onto the stack
-	* @param ref {number} The ID to push onto the stack
+	* @param {number} ref The ID to push onto the stack
 	*/
 	pushRef(ref) {
 		_luaPushRef(this.L, ref);
@@ -749,18 +866,34 @@ class LuaState {
 	* @returns A Lua.State representing the new thread
 	*/
 	fork() {
-		return new LuaState(this);
+		var thread = _luaNewThread(this.L);
+		return new LuaState(thread);
 	}
 }
 
 //var Lua = {};
+
+/**
+* Creates a new Lua.State
+* @returns {Lua.State} The created Lua.State
+*/
+Lua.createState = function() {
+	return new Lua.State(_luaNewState());
+};
+
 Lua.createLibraryData = createLibraryData;
 Lua.State = LuaState;
+Lua.Error = LuaError;
+Lua.Userdata = LuaUserdata;
 Lua.onprint = console.log;
 Lua.onprinterr = console.error;
 
 var readyListeners = [];
 
+/**
+* Run given function when Lua is ready
+* @param {function} f The function to call
+*/
 Lua.onready = function(f) {
 	readyListeners.push(f);
 }
